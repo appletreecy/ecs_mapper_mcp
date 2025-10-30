@@ -1,0 +1,4 @@
+.env.llm
+.venv
+mysql/data
+.idea

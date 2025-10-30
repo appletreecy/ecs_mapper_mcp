@@ -1,0 +1,8 @@
+mysql-connector-python
+python-dotenv
+rapidfuzz==3.9.6
+fastapi
+uvicorn
+pydantic
+mcp
+openai

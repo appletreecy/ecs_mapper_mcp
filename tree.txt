@@ -1,0 +1,14 @@
+ecs-mapper-mcp/
+├── docker-compose.yml
+├── .env
+├── requirements.txt
+├── mysql/
+│   └── init/
+│       └── 001_schema.sql
+├── app/
+│   ├── __init__.py
+│   ├── db.py
+│   ├── similar_mapper.py
+│   ├── api.py               # Optional FastAPI HTTP endpoint for testing
+│   └── mcp_server.py        # MCP server exposing suggest_mappings tool
+└── README.md
