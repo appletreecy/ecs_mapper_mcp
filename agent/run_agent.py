@@ -4,8 +4,12 @@ import sys
 import json
 import argparse
 import asyncio
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List  # ✅ ADDED
 from .db import get_conn
+
+# ✅ ADDED
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
 # Load LLM key if present
 try:
@@ -265,8 +269,66 @@ def upsert_mapping(
         cursor.close()
         conn.close()
 
+# =====================================================================================
+# ✅ ADDED: FastAPI service that accepts a batch of fields and performs mapping + upsert
+# =====================================================================================
+
+class SourceFieldIn(BaseModel):  # ✅ ADDED
+    sourcetype: str
+    field: str
+    description: str
+
+app = FastAPI(title="ECS Mapper MCP Service")  # ✅ ADDED
+
+@app.get("/health")  # ✅ ADDED
+async def health():
+    return {"status": "ok"}
+
+@app.post("/map-batch")  # ✅ ADDED
+async def map_batch(items: List[SourceFieldIn], limit: int = 5, model: str = MODEL):
+    """
+    Accepts a list of {sourcetype, field, description}, performs mapping for each,
+    and writes non-duplicate results into MySQL. Returns all results.
+    """
+    try:
+        # Run the MCP+LLM mapping concurrently for speed
+        tasks = [map_field(i.sourcetype, i.field, i.description, limit, model) for i in items]
+        results = await asyncio.gather(*tasks)
+
+        out = []
+        for res in results:
+            sourcetype = res["query"]["sourcetype"]
+            source_field = res["query"]["field"]
+            decision = res["llm_decision"]
+
+            mapped_field_name = decision["mapped_field_name"]
+            mapping_type = decision["mapping_type"]
+            rationale = decision.get("rationale", "")
+            confidence = float(decision.get("confidence", 0.5))
+
+            existed = mapping_exists(sourcetype, source_field, mapped_field_name)
+            if not existed:
+                upsert_mapping(sourcetype, source_field, mapping_type, mapped_field_name, rationale, confidence)
+
+            out.append({
+                "query": res["query"],
+                "hints": res["hints"],
+                "llm_decision": decision,
+                "db_status": "exists" if existed else "inserted"
+            })
+
+        return {"results": out}
+
+    except Exception as e:
+        # Surface the error text for quick debugging
+        raise HTTPException(status_code=500, detail=str(e))
+
+# =====================================================================================
+# The old CLI entry stays; it won't run when serving via uvicorn.
+# =====================================================================================
 
 if __name__ == "__main__":
+    # Old hardcoded demo loop kept for backward-compat (won’t run under uvicorn)
     source_fields = [{
         "sourcetype": "pan_traffic",
         "field": "department_phone_number",
@@ -279,22 +341,24 @@ if __name__ == "__main__":
 
     for source_field in source_fields:
         print(source_field)
-        result = asyncio.run(map_field(sourcetype=source_field["sourcetype"], field=source_field["field"], description=source_field["sourcetype"], limit=5, model="gpt-4.1-mini"))
+        result = asyncio.run(
+            map_field(
+                sourcetype=source_field["sourcetype"],
+                field=source_field["field"],
+                description=source_field["description"],
+                limit=5,
+                model="gpt-4.1-mini"
+            )
+        )
         sourcetype = result["query"]["sourcetype"]
-        source_field = result["query"]["field"]
+        field = result["query"]["field"]
         mapped_field_name = result["llm_decision"]["mapped_field_name"]
         mapping_type = result["llm_decision"]["mapping_type"]
         rationale = result["llm_decision"]["rationale"]
         confidence = result["llm_decision"]["confidence"]
 
-        if mapping_exists(sourcetype, source_field, mapped_field_name):
+        if mapping_exists(sourcetype, field, mapped_field_name):
             print("The row exists in DB already")
         else:
-            # write the result back to db
-            print(f"sourcetype, source_field, mapped_field_name, mapping_type, rationale, confidence is"
-                  f" {sourcetype} {source_field} {mapped_field_name} {mapping_type} {rationale} {confidence}")
-            print("write this record into DB")
-            upsert_mapping(sourcetype, source_field, mapping_type, mapped_field_name, rationale, confidence)
-
-
-
+            print(f"write this record into DB: {sourcetype} {field} {mapped_field_name} {mapping_type} {rationale} {confidence}")
+            upsert_mapping(sourcetype, field, mapping_type, mapped_field_name, rationale, confidence)
