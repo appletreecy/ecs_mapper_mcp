@@ -4,25 +4,35 @@ import sys
 import json
 import argparse
 import asyncio
-from typing import Any, Dict, Optional, List  # ✅ ADDED
+from datetime import datetime
+from typing import Any, Dict, Optional, List
+import logging
+
+# DB conn helper (you already have this)
 from .db import get_conn
 
-# ✅ ADDED
-from fastapi import FastAPI, HTTPException
+# FastAPI
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
-# Load LLM key if present
+# (Optional) CORS for local dev
+try:
+    from fastapi.middleware.cors import CORSMiddleware
+except Exception:
+    CORSMiddleware = None  # type: ignore
+
+# dotenv (optional)
 try:
     from dotenv import load_dotenv
     load_dotenv(".env.llm")
 except Exception:
     pass
 
-# OpenAI client (swap for your provider if desired)
+# OpenAI client (optional)
 try:
     from openai import OpenAI
 except Exception:
-    OpenAI = None  # We'll check at runtime
+    OpenAI = None  # type: ignore
 
 # MCP (stdio) client
 from mcp import ClientSession, StdioServerParameters
@@ -38,6 +48,19 @@ Rules:
 - Return strict JSON with keys: mapping_type, mapped_field_name, ecs_version, rationale, confidence (0..1).
 """
 
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,  # change to logging.DEBUG for more noise
+    format="[%(levelname)s] %(asctime)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+# -----------------------------------------------------------------------------
+# Prompt & MCP helpers
+# -----------------------------------------------------------------------------
 def build_user_prompt(llm_context: str, sourcetype: str, field: str, description: str) -> str:
     return f"""{llm_context}
 
@@ -58,25 +81,57 @@ Return JSON:
 def _unwrap_call_tool_result(result) -> Dict[str, Any]:
     """
     Normalize MCP CallToolResult into a plain dict.
-    Prefer json/object content; fallback to parsing text as JSON.
+    Handles json/object content, text (with or without code fences), or direct dicts.
     """
     if isinstance(result, dict):
         return result
 
     content = getattr(result, "content", None)
+
+    if isinstance(content, dict):
+        return content
+
     if isinstance(content, list):
+        # Prefer json/object items
         for item in content:
-            t = getattr(item, "type", None)
+            t = getattr(item, "type", None) or (isinstance(item, dict) and item.get("type"))
             if t in ("json", "object"):
-                val = getattr(item, "value", None)
+                val = getattr(item, "value", None) or (isinstance(item, dict) and item.get("value"))
                 if isinstance(val, dict):
                     return val
+
+        # Fallback to text; strip code fences and parse
+        for item in content:
+            t = getattr(item, "type", None) or (isinstance(item, dict) and item.get("type"))
             if t == "text":
-                txt = getattr(item, "text", "")
+                txt = getattr(item, "text", None) or (isinstance(item, dict) and item.get("text")) or ""
+                s = txt.strip()
+                if s.startswith("```"):
+                    s = s[3:]
+                    if "\n" in s:
+                        s = s.split("\n", 1)[1]
+                    s = s.rstrip("`")
                 try:
-                    return json.loads(txt)
+                    val = json.loads(s)
+                    if isinstance(val, dict):
+                        return val
                 except Exception:
                     pass
+
+    for attr in ("json", "model_dump"):
+        f = getattr(result, attr, None)
+        if callable(f):
+            try:
+                val = f()
+                if isinstance(val, dict):
+                    return val
+                if isinstance(val, str):
+                    j = json.loads(val)
+                    if isinstance(j, dict):
+                        return j
+            except Exception:
+                pass
+
     return {}
 
 async def call_mcp_suggest(
@@ -84,37 +139,49 @@ async def call_mcp_suggest(
     field: str,
     limit: int = 5,
     spawn_cmd: Optional[str] = None,
-    spawn_args: Optional[list] = None,
+    spawn_args: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Spawns the MCP server and calls the suggest_mappings tool.
-    Works whether you run from project root or agent/ by fixing PYTHONPATH.
     """
-    # Ensure app.* is importable for the spawned process
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    here = os.path.abspath(os.path.dirname(__file__))        # .../app
+    project_root = os.path.abspath(os.path.join(here, "..")) # .../
     env = dict(os.environ)
     env["PYTHONPATH"] = project_root + (":" + env["PYTHONPATH"] if "PYTHONPATH" in env else "")
 
     if spawn_cmd is None:
-        spawn_cmd = sys.executable  # use same venv interpreter
+        spawn_cmd = sys.executable
     if spawn_args is None:
         spawn_args = ["-m", "app.mcp_server"]
+
+    logger.debug(f"[MCP] Launching: {spawn_cmd} {' '.join(spawn_args)}")
+    logger.debug(f"[MCP] PYTHONPATH={env.get('PYTHONPATH')}")
 
     server_params = StdioServerParameters(command=spawn_cmd, args=spawn_args, env=env)
 
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
-            await session.initialize()
-            # optional: ensure tool exists
-            tools = await session.list_tools()
-            names = [t.name for t in getattr(tools, "tools", [])]
-            if "suggest_mappings" not in names:
-                raise RuntimeError("MCP tool 'suggest_mappings' not found. Is app.mcp_server correct?")
+            init = await session.initialize()
+            logger.debug(f"[MCP] initialize -> {getattr(init, 'capabilities', None)}")
+
+            tools_resp = await session.list_tools()
+            tool_names = [t.name for t in getattr(tools_resp, "tools", [])]
+            logger.debug(f"[MCP] tools -> {tool_names}")
+
+            if "suggest_mappings" not in tool_names:
+                raise RuntimeError(
+                    f"MCP tool 'suggest_mappings' not found. Tools: {tool_names}. "
+                    "Check app.mcp_server exports."
+                )
+
             result = await session.call_tool(
                 "suggest_mappings",
-                {"sourcetype": sourcetype, "field": field, "limit": limit}
+                {"args": {"sourcetype": sourcetype, "field": field, "limit": limit}}
             )
-            return _unwrap_call_tool_result(result)
+            logger.debug(f"[MCP] raw CallToolResult: {result}")
+            unwrapped = _unwrap_call_tool_result(result)
+            logger.debug(f"[MCP] unwrapped -> {unwrapped}")
+            return unwrapped or {}
 
 def ask_llm_openai(
     model: str,
@@ -127,7 +194,7 @@ def ask_llm_openai(
     """
     if OpenAI is None:
         return {"error": "openai python package not available"}
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv(api_key_env)
     if not api_key:
         return {"error": f"{api_key_env} not set in environment"}
 
@@ -142,7 +209,6 @@ def ask_llm_openai(
     )
     text = resp.choices[0].message.content if resp.choices else ""
 
-    # Try strict JSON parse, then try extracting a JSON object
     try:
         return json.loads(text)
     except Exception:
@@ -159,24 +225,20 @@ def validate_mapping(payload: Dict[str, Any], field: str) -> Dict[str, Any]:
     """
     Minimal validator/normalizer for the LLM response.
     """
-    out = dict(payload) if isinstance(payload, dict) else {"raw": payload}
+    out: Dict[str, Any] = dict(payload) if isinstance(payload, dict) else {"raw": payload}
     mt = out.get("mapping_type")
     name = out.get("mapped_field_name")
     conf = out.get("confidence")
 
-    # mapping_type
     if mt not in {"ecs", "non-ecs"}:
         out["mapping_type"] = "non-ecs" if (isinstance(name, str) and name.startswith("custom_prefix_")) else "ecs"
 
-    # mapped_field_name
     if not name or not isinstance(name, str):
         out["mapped_field_name"] = f"custom_prefix_{field}"
 
-    # ecs_version
     if not out.get("ecs_version"):
         out["ecs_version"] = "8.10.0"
 
-    # confidence
     try:
         c = float(conf)
         c = max(0.0, min(1.0, c))
@@ -184,7 +246,6 @@ def validate_mapping(payload: Dict[str, Any], field: str) -> Dict[str, Any]:
     except Exception:
         out["confidence"] = 0.50
 
-    # rationale
     if not out.get("rationale"):
         out["rationale"] = "Auto-filled rationale; please review."
 
@@ -197,18 +258,16 @@ async def map_field(
     limit: int,
     model: str,
 ) -> Dict[str, Any]:
-    # 1) retrieve prior mapping hints via MCP
     mcp_result = await call_mcp_suggest(sourcetype, field, limit=limit)
-    llm_context = mcp_result.get("llm_context", "")
-    hints = mcp_result.get("top", mcp_result.get("top5", []))
+    logger.info(f"[MAP] mcp_result -> {mcp_result!r}")
 
-    # 2) build user prompt
+    llm_context = (mcp_result or {}).get("llm_context", "")
+    hints = (mcp_result or {}).get("top", (mcp_result or {}).get("top5", []))
+
     user_prompt = build_user_prompt(llm_context, sourcetype, field, description)
 
-    # 3) call LLM
     llm_raw = ask_llm_openai(model=model, system_prompt=SYSTEM_PROMPT, user_prompt=user_prompt)
 
-    # 4) validate/normalize
     llm_decision = validate_mapping(llm_raw, field)
 
     return {
@@ -228,7 +287,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", default=MODEL, help="LLM model name")
     return p.parse_args()
 
-def mapping_exists(sourcetype:str, source_field: str, mapped_field_name: str) -> bool:
+def mapping_exists(sourcetype: str, source_field: str, mapped_field_name: str) -> bool:
     conn = get_conn()
     try:
         cursor = conn.cursor()
@@ -242,15 +301,17 @@ def mapping_exists(sourcetype:str, source_field: str, mapped_field_name: str) ->
         )
         return cursor.fetchone() is not None
     finally:
-        cursor.close()
-        conn.close()
+        try: cursor.close()
+        except Exception: pass
+        try: conn.close()
+        except Exception: pass
 
 def upsert_mapping(
     sourcetype: str,
     source_field: str,
     mapping_type: str,
     mapped_field_name: str,
-    rationale: str = None,
+    rationale: Optional[str] = None,
     confidence: float = 0.80,
 ):
     conn = get_conn()
@@ -265,78 +326,210 @@ def upsert_mapping(
             """,
             (sourcetype, source_field, mapping_type, mapped_field_name, rationale, confidence),
         )
+        conn.commit()
     finally:
-        cursor.close()
-        conn.close()
+        try: cursor.close()
+        except Exception: pass
+        try: conn.close()
+        except Exception: pass
 
-# =====================================================================================
-# ✅ ADDED: FastAPI service that accepts a batch of fields and performs mapping + upsert
-# =====================================================================================
+# =============================================================================
+# FastAPI service
+# =============================================================================
 
-class SourceFieldIn(BaseModel):  # ✅ ADDED
+class SourceFieldIn(BaseModel):
     sourcetype: str
     field: str
     description: str
 
-app = FastAPI(title="ECS Mapper MCP Service")  # ✅ ADDED
+class MappingUpdateIn(BaseModel):
+    human_verified: Optional[bool] = None
+    mapped_field_name: Optional[str] = None
 
-@app.get("/health")  # ✅ ADDED
+app = FastAPI(title="ECS Mapper MCP Service")
+
+# CORS in dev (optional)
+if CORSMiddleware:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+@app.get("/health")
 async def health():
     return {"status": "ok"}
 
-@app.post("/map-batch")  # ✅ ADDED
-async def map_batch(items: List[SourceFieldIn], limit: int = 5, model: str = MODEL):
-    """
-    Accepts a list of {sourcetype, field, description}, performs mapping for each,
-    and writes non-duplicate results into MySQL. Returns all results.
-    """
+@app.patch("/mappings/{mapping_id}")
+def update_mapping(mapping_id: int, payload: MappingUpdateIn):
+    conn = get_conn()
     try:
-        # Run the MCP+LLM mapping concurrently for speed
-        tasks = [map_field(i.sourcetype, i.field, i.description, limit, model) for i in items]
-        results = await asyncio.gather(*tasks)
+        sets: List[str] = []
+        params: List[Any] = []
 
-        out = []
-        for res in results:
-            sourcetype = res["query"]["sourcetype"]
-            source_field = res["query"]["field"]
-            decision = res["llm_decision"]
+        if payload.human_verified is not None:
+            sets.append("human_verified = %s")
+            params.append(1 if payload.human_verified else 0)
 
-            mapped_field_name = decision["mapped_field_name"]
-            mapping_type = decision["mapping_type"]
-            rationale = decision.get("rationale", "")
-            confidence = float(decision.get("confidence", 0.5))
+        if payload.mapped_field_name is not None:
+            name = payload.mapped_field_name.strip()
+            if not name:
+                raise HTTPException(status_code=400, detail="mapped_field_name cannot be empty")
+            sets.append("mapped_field_name = %s")
+            params.append(name)
 
-            existed = mapping_exists(sourcetype, source_field, mapped_field_name)
-            if not existed:
-                upsert_mapping(sourcetype, source_field, mapping_type, mapped_field_name, rationale, confidence)
+        if not sets:
+            raise HTTPException(status_code=400, detail="No updatable fields provided")
 
-            out.append({
-                "query": res["query"],
-                "hints": res["hints"],
-                "llm_decision": decision,
-                "db_status": "exists" if existed else "inserted"
-            })
+        sets.append("updated_at = NOW()")
 
-        return {"results": out}
+        sql = f"UPDATE field_mapping SET {', '.join(sets)} WHERE id = %s"
+        params.append(mapping_id)
+
+        cursor = conn.cursor()
+        cursor.execute(sql, params)
+        conn.commit()
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Mapping not found")
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print("Error in PATCH /mappings/{mapping_id}:\n", "".join(traceback.format_exception(e)))
+        raise HTTPException(status_code=500, detail="Internal error in PATCH /mappings")
+    finally:
+        try: cursor.close()
+        except Exception: pass
+        try: conn.close()
+        except Exception: pass
+
+
+# -----------------------------------------------------------------------------
+# GET /mappings  (list with search + pagination)
+# -----------------------------------------------------------------------------
+@app.get("/mappings")
+def get_mappings(
+    search: str = Query("", description="Optional search filter"),
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(20, ge=1, le=200),
+):
+    """
+    Returns paginated list of field_mapping records.
+    - Case-insensitive search across sourcetype/source_field/mapped_field_name
+    - Casts confidence to CHAR to avoid Decimal JSON serialization errors
+    - Uses updated_at as created_at for the UI if created_at isn't present
+    - Includes human_verified (as bool)
+    """
+    conn = get_conn()
+    try:
+        cursor = conn.cursor(dictionary=True)
+
+        offset = (page - 1) * pageSize
+        params: List[Any] = []
+        where = ""
+        if search:
+            where = """
+            WHERE
+                LOWER(sourcetype) LIKE %s OR
+                LOWER(source_field) LIKE %s OR
+                LOWER(mapped_field_name) LIKE %s
+            """
+            like = f"%{search.lower()}%"
+            params.extend([like, like, like])
+
+        data_sql = f"""
+            SELECT
+                id,
+                sourcetype,
+                source_field,
+                mapped_field_name,
+                mapping_type,
+                rationale,
+                COALESCE(CAST(confidence AS CHAR), NULL) AS confidence,
+                -- your table has updated_at; alias to created_at for the UI
+                COALESCE(updated_at, NOW()) AS created_at,
+                -- new column for UI editing
+                COALESCE(human_verified, 0) AS human_verified
+            FROM field_mapping
+            {where}
+            ORDER BY id DESC
+            LIMIT %s OFFSET %s
+        """
+        cursor.execute(data_sql, params + [pageSize, offset])
+        items = cursor.fetchall() or []
+
+        count_sql = f"SELECT COUNT(*) AS total FROM field_mapping {where}"
+        cursor.execute(count_sql, params)
+        row = cursor.fetchone() or {"total": 0}
+        total = int(row["total"])
+
+        # normalize for JSON
+        for item in items:
+            ca = item.get("created_at")
+            if isinstance(ca, datetime):
+                item["created_at"] = ca.isoformat()
+            # ensure boolean for UI
+            item["human_verified"] = bool(item.get("human_verified"))
+
+        return {"items": items, "total": total}
 
     except Exception as e:
-        # Surface the error text for quick debugging
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        print("Error in GET /mappings:\n", "".join(traceback.format_exception(e)))
+        raise HTTPException(status_code=500, detail="Internal error in /mappings")
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
-# =====================================================================================
-# The old CLI entry stays; it won't run when serving via uvicorn.
-# =====================================================================================
+# -----------------------------------------------------------------------------
+# PATCH /mappings/{id}  (update human_verified)
+# -----------------------------------------------------------------------------
+@app.patch("/mappings/{mapping_id}")
+def update_mapping(mapping_id: int, payload: MappingUpdateIn):
+    conn = get_conn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE field_mapping
+               SET human_verified = %s,
+                   updated_at = NOW()
+             WHERE id = %s
+            """,
+            (1 if payload.human_verified else 0, mapping_id),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Mapping not found")
+        return {"ok": True}
+    except Exception as e:
+        import traceback
+        print("Error in PATCH /mappings/{mapping_id}:\n", "".join(traceback.format_exception(e)))
+        raise HTTPException(status_code=500, detail="Internal error in PATCH /mappings")
+    finally:
+        try: cursor.close()
+        except Exception: pass
+        try: conn.close()
+        except Exception: pass
 
+# =============================================================================
+# CLI entry (will not run under uvicorn)
+# =============================================================================
 if __name__ == "__main__":
-    # Old hardcoded demo loop kept for backward-compat (won’t run under uvicorn)
+    args = parse_args()
     source_fields = [{
-        "sourcetype": "pan_traffic",
-        "field": "department_phone_number",
-        "description": "the phone number of this department"
-    }, {
-        "sourcetype": "pan_traffic",
-        "field": "department_abn",
-        "description": "the abn number of this department"
+        "sourcetype": args.sourcetype,
+        "field": args.field,
+        "description": args.description,
     }]
 
     for source_field in source_fields:
@@ -346,8 +539,8 @@ if __name__ == "__main__":
                 sourcetype=source_field["sourcetype"],
                 field=source_field["field"],
                 description=source_field["description"],
-                limit=5,
-                model="gpt-4.1-mini"
+                limit=args.limit,
+                model=args.model,
             )
         )
         sourcetype = result["query"]["sourcetype"]
@@ -360,5 +553,8 @@ if __name__ == "__main__":
         if mapping_exists(sourcetype, field, mapped_field_name):
             print("The row exists in DB already")
         else:
-            print(f"write this record into DB: {sourcetype} {field} {mapped_field_name} {mapping_type} {rationale} {confidence}")
+            print(
+                "write this record into DB:",
+                sourcetype, field, mapped_field_name, mapping_type, rationale, confidence
+            )
             upsert_mapping(sourcetype, field, mapping_type, mapped_field_name, rationale, confidence)
