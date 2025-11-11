@@ -8,12 +8,15 @@ from datetime import datetime
 from typing import Any, Dict, Optional, List
 import logging
 
-# DB conn helper (you already have this)
+# DB conn helper
 from .db import get_conn
 
 # FastAPI
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
+
+# Static frontend mounting (moved out)
+from .static_frontend import mount_vite_frontend
 
 # (Optional) CORS for local dev
 try:
@@ -52,7 +55,7 @@ Rules:
 # Logging
 # -----------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.INFO,  # change to logging.DEBUG for more noise
+    level=logging.INFO,  # change to logging.DEBUG for more verbosity
     format="[%(levelname)s] %(asctime)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -362,6 +365,88 @@ if CORSMiddleware:
 async def health():
     return {"status": "ok"}
 
+# -----------------------------------------------------------------------------
+# GET /mappings  (list with search + pagination)
+# -----------------------------------------------------------------------------
+@app.get("/mappings")
+def get_mappings(
+    search: str = Query("", description="Optional search filter"),
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(20, ge=1, le=200),
+):
+    """
+    Returns paginated list of field_mapping records.
+    - Case-insensitive search across sourcetype/source_field/mapped_field_name
+    - Casts confidence to CHAR to avoid Decimal JSON serialization errors
+    - Uses updated_at as created_at for the UI if created_at isn't present
+    - Includes human_verified (as bool)
+    """
+    conn = get_conn()
+    try:
+        cursor = conn.cursor(dictionary=True)
+
+        offset = (page - 1) * pageSize
+        params: List[Any] = []
+        where = ""
+        if search:
+            where = """
+            WHERE
+                LOWER(sourcetype) LIKE %s OR
+                LOWER(source_field) LIKE %s OR
+                LOWER(mapped_field_name) LIKE %s
+            """
+            like = f"%{search.lower()}%"
+            params.extend([like, like, like])
+
+        data_sql = f"""
+            SELECT
+                id,
+                sourcetype,
+                source_field,
+                mapped_field_name,
+                mapping_type,
+                rationale,
+                COALESCE(CAST(confidence AS CHAR), NULL) AS confidence,
+                COALESCE(updated_at, NOW()) AS created_at,
+                COALESCE(human_verified, 0) AS human_verified
+            FROM field_mapping
+            {where}
+            ORDER BY id DESC
+            LIMIT %s OFFSET %s
+        """
+        cursor.execute(data_sql, params + [pageSize, offset])
+        items = cursor.fetchall() or []
+
+        count_sql = f"SELECT COUNT(*) AS total FROM field_mapping {where}"
+        cursor.execute(count_sql, params)
+        row = cursor.fetchone() or {"total": 0}
+        total = int(row["total"])
+
+        for item in items:
+            ca = item.get("created_at")
+            if isinstance(ca, datetime):
+                item["created_at"] = ca.isoformat()
+            item["human_verified"] = bool(item.get("human_verified"))
+
+        return {"items": items, "total": total}
+
+    except Exception as e:
+        import traceback
+        print("Error in GET /mappings:\n", "".join(traceback.format_exception(e)))
+        raise HTTPException(status_code=500, detail="Internal error in /mappings")
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+# -----------------------------------------------------------------------------
+# PATCH /mappings/{id}  (update human_verified and/or mapped_field_name)
+# -----------------------------------------------------------------------------
 @app.patch("/mappings/{mapping_id}")
 def update_mapping(mapping_id: int, payload: MappingUpdateIn):
     conn = get_conn()
@@ -406,121 +491,6 @@ def update_mapping(mapping_id: int, payload: MappingUpdateIn):
         try: conn.close()
         except Exception: pass
 
-
-# -----------------------------------------------------------------------------
-# GET /mappings  (list with search + pagination)
-# -----------------------------------------------------------------------------
-@app.get("/mappings")
-def get_mappings(
-    search: str = Query("", description="Optional search filter"),
-    page: int = Query(1, ge=1),
-    pageSize: int = Query(20, ge=1, le=200),
-):
-    """
-    Returns paginated list of field_mapping records.
-    - Case-insensitive search across sourcetype/source_field/mapped_field_name
-    - Casts confidence to CHAR to avoid Decimal JSON serialization errors
-    - Uses updated_at as created_at for the UI if created_at isn't present
-    - Includes human_verified (as bool)
-    """
-    conn = get_conn()
-    try:
-        cursor = conn.cursor(dictionary=True)
-
-        offset = (page - 1) * pageSize
-        params: List[Any] = []
-        where = ""
-        if search:
-            where = """
-            WHERE
-                LOWER(sourcetype) LIKE %s OR
-                LOWER(source_field) LIKE %s OR
-                LOWER(mapped_field_name) LIKE %s
-            """
-            like = f"%{search.lower()}%"
-            params.extend([like, like, like])
-
-        data_sql = f"""
-            SELECT
-                id,
-                sourcetype,
-                source_field,
-                mapped_field_name,
-                mapping_type,
-                rationale,
-                COALESCE(CAST(confidence AS CHAR), NULL) AS confidence,
-                -- your table has updated_at; alias to created_at for the UI
-                COALESCE(updated_at, NOW()) AS created_at,
-                -- new column for UI editing
-                COALESCE(human_verified, 0) AS human_verified
-            FROM field_mapping
-            {where}
-            ORDER BY id DESC
-            LIMIT %s OFFSET %s
-        """
-        cursor.execute(data_sql, params + [pageSize, offset])
-        items = cursor.fetchall() or []
-
-        count_sql = f"SELECT COUNT(*) AS total FROM field_mapping {where}"
-        cursor.execute(count_sql, params)
-        row = cursor.fetchone() or {"total": 0}
-        total = int(row["total"])
-
-        # normalize for JSON
-        for item in items:
-            ca = item.get("created_at")
-            if isinstance(ca, datetime):
-                item["created_at"] = ca.isoformat()
-            # ensure boolean for UI
-            item["human_verified"] = bool(item.get("human_verified"))
-
-        return {"items": items, "total": total}
-
-    except Exception as e:
-        import traceback
-        print("Error in GET /mappings:\n", "".join(traceback.format_exception(e)))
-        raise HTTPException(status_code=500, detail="Internal error in /mappings")
-    finally:
-        try:
-            cursor.close()
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-# -----------------------------------------------------------------------------
-# PATCH /mappings/{id}  (update human_verified)
-# -----------------------------------------------------------------------------
-@app.patch("/mappings/{mapping_id}")
-def update_mapping(mapping_id: int, payload: MappingUpdateIn):
-    conn = get_conn()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            UPDATE field_mapping
-               SET human_verified = %s,
-                   updated_at = NOW()
-             WHERE id = %s
-            """,
-            (1 if payload.human_verified else 0, mapping_id),
-        )
-        conn.commit()
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Mapping not found")
-        return {"ok": True}
-    except Exception as e:
-        import traceback
-        print("Error in PATCH /mappings/{mapping_id}:\n", "".join(traceback.format_exception(e)))
-        raise HTTPException(status_code=500, detail="Internal error in PATCH /mappings")
-    finally:
-        try: cursor.close()
-        except Exception: pass
-        try: conn.close()
-        except Exception: pass
-
 # =========================
 # /map-batch (POST)
 # =========================
@@ -534,7 +504,7 @@ class MapBatchResponse(BaseModel):
 
 @app.post("/map-batch", response_model=MapBatchResponse)
 async def map_batch(
-    items: list[BatchInputItem],
+    items: List[BatchInputItem],
     limit: int = Query(5, ge=1, le=20),
     model: str = Query(MODEL)
 ):
@@ -545,7 +515,6 @@ async def map_batch(
     if not items:
         raise HTTPException(status_code=400, detail="Payload must be a non-empty array")
 
-    # Map concurrently
     tasks = [
         map_field(
             sourcetype=i.sourcetype,
@@ -577,7 +546,7 @@ async def map_batch(
             })
             continue
 
-        # Upsert to DB (same logic as __main__)
+        # Upsert to DB
         try:
             sourcetype = res["query"]["sourcetype"]
             field = res["query"]["field"]
@@ -604,9 +573,18 @@ async def map_batch(
 
     return {"results": results}
 
+# =========================
+# Mount static frontend (Vite) from separate module
+# =========================
+# Default: expects ../frontend/dist relative to this file. Override with env FRONTEND_DIST if you want.
+mount_vite_frontend(app)
+# Or, to force a path:
+# from pathlib import Path
+# dist_from_env = os.getenv("FRONTEND_DIST")
+# mount_vite_frontend(app, dist_dir=Path(dist_from_env) if dist_from_env else None)
 
 # =============================================================================
-# CLI entry (will not run under uvicorn)
+# CLI entry (manual one-off)
 # =============================================================================
 if __name__ == "__main__":
     args = parse_args()
