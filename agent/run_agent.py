@@ -521,6 +521,90 @@ def update_mapping(mapping_id: int, payload: MappingUpdateIn):
         try: conn.close()
         except Exception: pass
 
+# =========================
+# /map-batch (POST)
+# =========================
+class BatchInputItem(BaseModel):
+    sourcetype: str
+    field: str
+    description: str
+
+class MapBatchResponse(BaseModel):
+    results: list
+
+@app.post("/map-batch", response_model=MapBatchResponse)
+async def map_batch(
+    items: list[BatchInputItem],
+    limit: int = Query(5, ge=1, le=20),
+    model: str = Query(MODEL)
+):
+    """
+    Accepts a list of {sourcetype, field, description} and returns LLM mapping
+    decisions for each. Also writes to DB (INSERT IGNORE) and reports db_status.
+    """
+    if not items:
+        raise HTTPException(status_code=400, detail="Payload must be a non-empty array")
+
+    # Map concurrently
+    tasks = [
+        map_field(
+            sourcetype=i.sourcetype,
+            field=i.field,
+            description=i.description,
+            limit=limit,
+            model=model,
+        )
+        for i in items
+    ]
+    mapped = await asyncio.gather(*tasks, return_exceptions=True)
+
+    results = []
+    for i, res in enumerate(mapped):
+        item = items[i]
+        if isinstance(res, Exception):
+            results.append({
+                "query": {"sourcetype": item.sourcetype, "field": item.field, "limit": limit, "model": model},
+                "hints": [],
+                "llm_prompt": "",
+                "llm_decision": {
+                    "mapping_type": "non-ecs",
+                    "mapped_field_name": f"custom_prefix_{item.field}",
+                    "ecs_version": "8.10.0",
+                    "rationale": f"Error during mapping: {type(res).__name__}",
+                    "confidence": 0.0,
+                },
+                "db_status": "error",
+            })
+            continue
+
+        # Upsert to DB (same logic as __main__)
+        try:
+            sourcetype = res["query"]["sourcetype"]
+            field = res["query"]["field"]
+            decision = res["llm_decision"]
+
+            mapped_field_name = decision["mapped_field_name"]
+            mapping_type = decision["mapping_type"]
+            rationale = decision.get("rationale")
+            confidence = float(decision.get("confidence", 0.5))
+
+            if mapping_exists(sourcetype, field, mapped_field_name):
+                db_status = "exists"
+            else:
+                upsert_mapping(
+                    sourcetype, field, mapping_type, mapped_field_name, rationale, confidence
+                )
+                db_status = "inserted"
+
+            res["db_status"] = db_status
+        except Exception:
+            res["db_status"] = "error"
+
+        results.append(res)
+
+    return {"results": results}
+
+
 # =============================================================================
 # CLI entry (will not run under uvicorn)
 # =============================================================================
