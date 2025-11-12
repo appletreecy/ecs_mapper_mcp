@@ -1,15 +1,32 @@
+# db.py
 import os
-import mysql.connector
 from dotenv import load_dotenv
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+
+# Load .env (optional but handy for local dev)
 load_dotenv()
 
-def get_conn():
-    return mysql.connector.connect(
-        host=os.getenv("MYSQL_HOST", "127.0.0.1"),
-        port=int(os.getenv("MYSQL_PORT", "3306")),
-        user=os.getenv("MYSQL_USER", "ecs_user"),
-        password=os.getenv("MYSQL_PASSWORD", "ecspass"),
-        database=os.getenv("MYSQL_DB", "ecs_mapper"),
-        autocommit=True,
-    )
+# Use env var if present; otherwise fall back to your default DSN
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "mysql+pymysql://root:rootpass@127.0.0.1:3306/ecs_mapper?charset=utf8mb4",
+)
+
+engine = create_engine(
+    DATABASE_URL,
+    echo=False,
+    future=True,
+    pool_pre_ping=True,
+)
+
+SessionLocal = sessionmaker(
+    bind=engine,
+    autocommit=False,
+    autoflush=False,
+    future=True,
+)
+
+# ❗ remove the trailing comma here
+Base = declarative_base()

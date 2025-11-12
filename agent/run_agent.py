@@ -8,8 +8,11 @@ from datetime import datetime
 from typing import Any, Dict, Optional, List
 import logging
 
-# DB conn helper
-from .db import get_conn
+# SQLAlchemy
+from sqlalchemy import text
+
+# DB helpers (now from SQLAlchemy-based db.py)
+from .db import SessionLocal
 
 # FastAPI
 from fastapi import FastAPI, HTTPException, Query
@@ -210,19 +213,19 @@ def ask_llm_openai(
             {"role": "user",   "content": user_prompt},
         ],
     )
-    text = resp.choices[0].message.content if resp.choices else ""
+    text_resp = resp.choices[0].message.content if resp.choices else ""
 
     try:
-        return json.loads(text)
+        return json.loads(text_resp)
     except Exception:
-        start = text.find("{")
-        end = text.rfind("}")
+        start = text_resp.find("{")
+        end = text_resp.rfind("}")
         if start != -1 and end != -1 and end > start:
             try:
-                return json.loads(text[start:end+1])
+                return json.loads(text_resp[start:end+1])
             except Exception:
                 pass
-        return {"raw": text, "error": "Model did not return valid JSON"}
+        return {"raw": text_resp, "error": "Model did not return valid JSON"}
 
 def validate_mapping(payload: Dict[str, Any], field: str) -> Dict[str, Any]:
     """
@@ -290,24 +293,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", default=MODEL, help="LLM model name")
     return p.parse_args()
 
+# =============================================================================
+# SQLAlchemy-based DB helpers (replacing mysql-connector code)
+# =============================================================================
 def mapping_exists(sourcetype: str, source_field: str, mapped_field_name: str) -> bool:
-    conn = get_conn()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT 1 FROM field_mapping
-            WHERE sourcetype=%s AND source_field=%s AND mapped_field_name=%s
-            LIMIT 1
-            """,
-            (sourcetype, source_field, mapped_field_name),
-        )
-        return cursor.fetchone() is not None
-    finally:
-        try: cursor.close()
-        except Exception: pass
-        try: conn.close()
-        except Exception: pass
+    with SessionLocal() as session:
+        row = session.execute(
+            text(
+                """
+                SELECT 1 FROM field_mapping
+                WHERE sourcetype = :s AND source_field = :f AND mapped_field_name = :m
+                LIMIT 1
+                """
+            ),
+            {"s": sourcetype, "f": source_field, "m": mapped_field_name},
+        ).first()
+        return row is not None
 
 def upsert_mapping(
     sourcetype: str,
@@ -317,24 +318,27 @@ def upsert_mapping(
     rationale: Optional[str] = None,
     confidence: float = 0.80,
 ):
-    conn = get_conn()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT IGNORE INTO field_mapping (
-                sourcetype, source_field, mapping_type, mapped_field_name,
-                rationale, confidence
-            ) VALUES (%s, %s, %s, %s, %s, %s)
-            """,
-            (sourcetype, source_field, mapping_type, mapped_field_name, rationale, confidence),
+    with SessionLocal() as session:
+        session.execute(
+            text(
+                """
+                INSERT IGNORE INTO field_mapping (
+                    sourcetype, source_field, mapping_type, mapped_field_name,
+                    rationale, confidence
+                )
+                VALUES (:s, :f, :t, :m, :r, :c)
+                """
+            ),
+            {
+                "s": sourcetype,
+                "f": source_field,
+                "t": mapping_type,
+                "m": mapped_field_name,
+                "r": rationale,
+                "c": confidence,
+            },
         )
-        conn.commit()
-    finally:
-        try: cursor.close()
-        except Exception: pass
-        try: conn.close()
-        except Exception: pass
+        session.commit()
 
 # =============================================================================
 # FastAPI service
@@ -375,30 +379,28 @@ def get_mappings(
     pageSize: int = Query(20, ge=1, le=200),
 ):
     """
-    Returns paginated list of field_mapping records.
+    Returns paginated list of field_mapping records using SQLAlchemy.
     - Case-insensitive search across sourcetype/source_field/mapped_field_name
-    - Casts confidence to CHAR to avoid Decimal JSON serialization errors
+    - Casts confidence to CHAR to avoid Decimal JSON serialization issues
     - Uses updated_at as created_at for the UI if created_at isn't present
     - Includes human_verified (as bool)
     """
-    conn = get_conn()
     try:
-        cursor = conn.cursor(dictionary=True)
-
         offset = (page - 1) * pageSize
-        params: List[Any] = []
+
+        params: Dict[str, Any] = {"limit": pageSize, "offset": offset}
         where = ""
         if search:
             where = """
-            WHERE
-                LOWER(sourcetype) LIKE %s OR
-                LOWER(source_field) LIKE %s OR
-                LOWER(mapped_field_name) LIKE %s
+                WHERE
+                    LOWER(sourcetype) LIKE :q OR
+                    LOWER(source_field) LIKE :q OR
+                    LOWER(mapped_field_name) LIKE :q
             """
-            like = f"%{search.lower()}%"
-            params.extend([like, like, like])
+            params["q"] = f"%{search.lower()}%"
 
-        data_sql = f"""
+        data_sql = text(
+            f"""
             SELECT
                 id,
                 sourcetype,
@@ -412,84 +414,82 @@ def get_mappings(
             FROM field_mapping
             {where}
             ORDER BY id DESC
-            LIMIT %s OFFSET %s
-        """
-        cursor.execute(data_sql, params + [pageSize, offset])
-        items = cursor.fetchall() or []
+            LIMIT :limit OFFSET :offset
+            """
+        )
 
-        count_sql = f"SELECT COUNT(*) AS total FROM field_mapping {where}"
-        cursor.execute(count_sql, params)
-        row = cursor.fetchone() or {"total": 0}
-        total = int(row["total"])
+        count_sql = text(
+            f"""
+            SELECT COUNT(*) AS total
+            FROM field_mapping
+            {where}
+            """
+        )
 
-        for item in items:
-            ca = item.get("created_at")
+        with SessionLocal() as session:
+            rows = session.execute(data_sql, params).mappings().all()
+            total_row = session.execute(count_sql, params).mappings().first()
+            total = int(total_row["total"]) if total_row else 0
+
+        # Convert RowMapping -> dict and normalize
+        items: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)  # <-- make it mutable
+            ca = d.get("created_at")
             if isinstance(ca, datetime):
-                item["created_at"] = ca.isoformat()
-            item["human_verified"] = bool(item.get("human_verified"))
+                d["created_at"] = ca.isoformat()
+            # ensure boolean for frontend
+            d["human_verified"] = bool(d.get("human_verified"))
+            items.append(d)
 
         return {"items": items, "total": total}
 
     except Exception as e:
         import traceback
-        print("Error in GET /mappings:\n", "".join(traceback.format_exception(e)))
+        logger.error("Error in GET /mappings:\n%s", "".join(traceback.format_exception(e)))
         raise HTTPException(status_code=500, detail="Internal error in /mappings")
-    finally:
-        try:
-            cursor.close()
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
+
 
 # -----------------------------------------------------------------------------
 # PATCH /mappings/{id}  (update human_verified and/or mapped_field_name)
 # -----------------------------------------------------------------------------
 @app.patch("/mappings/{mapping_id}")
 def update_mapping(mapping_id: int, payload: MappingUpdateIn):
-    conn = get_conn()
+    sets: List[str] = []
+    params: Dict[str, Any] = {"id": mapping_id}
+
+    if payload.human_verified is not None:
+        sets.append("human_verified = :hv")
+        params["hv"] = 1 if payload.human_verified else 0
+
+    if payload.mapped_field_name is not None:
+        name = payload.mapped_field_name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="mapped_field_name cannot be empty")
+        sets.append("mapped_field_name = :name")
+        params["name"] = name
+
+    if not sets:
+        raise HTTPException(status_code=400, detail="No updatable fields provided")
+
+    sets.append("updated_at = NOW()")
+
     try:
-        sets: List[str] = []
-        params: List[Any] = []
-
-        if payload.human_verified is not None:
-            sets.append("human_verified = %s")
-            params.append(1 if payload.human_verified else 0)
-
-        if payload.mapped_field_name is not None:
-            name = payload.mapped_field_name.strip()
-            if not name:
-                raise HTTPException(status_code=400, detail="mapped_field_name cannot be empty")
-            sets.append("mapped_field_name = %s")
-            params.append(name)
-
-        if not sets:
-            raise HTTPException(status_code=400, detail="No updatable fields provided")
-
-        sets.append("updated_at = NOW()")
-
-        sql = f"UPDATE field_mapping SET {', '.join(sets)} WHERE id = %s"
-        params.append(mapping_id)
-
-        cursor = conn.cursor()
-        cursor.execute(sql, params)
-        conn.commit()
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Mapping not found")
+        with SessionLocal() as session:
+            res = session.execute(
+                text(f"UPDATE field_mapping SET {', '.join(sets)} WHERE id = :id"),
+                params,
+            )
+            session.commit()
+            if res.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Mapping not found")
         return {"ok": True}
     except HTTPException:
         raise
     except Exception as e:
         import traceback
-        print("Error in PATCH /mappings/{mapping_id}:\n", "".join(traceback.format_exception(e)))
+        logger.error("Error in PATCH /mappings/{id}:\n%s", "".join(traceback.format_exception(e)))
         raise HTTPException(status_code=500, detail="Internal error in PATCH /mappings")
-    finally:
-        try: cursor.close()
-        except Exception: pass
-        try: conn.close()
-        except Exception: pass
 
 # =========================
 # /map-batch (POST)
@@ -576,12 +576,7 @@ async def map_batch(
 # =========================
 # Mount static frontend (Vite) from separate module
 # =========================
-# Default: expects ../frontend/dist relative to this file. Override with env FRONTEND_DIST if you want.
 mount_vite_frontend(app)
-# Or, to force a path:
-# from pathlib import Path
-# dist_from_env = os.getenv("FRONTEND_DIST")
-# mount_vite_frontend(app, dist_dir=Path(dist_from_env) if dist_from_env else None)
 
 # =============================================================================
 # CLI entry (manual one-off)
